@@ -74,7 +74,7 @@ def density_operator(coherence):
     matrix_dn = vector_dn @ vector_dn.T
     matrix_tot = 0.5 * matrix_up + 0.5 * matrix_dn
     density_op = (matrix_tot 
-                  - coherence * (matrix_tot - np.diag(matrix_tot))) # Shape: (4,4)
+                  - ( 1 - coherence) * (matrix_tot - np.diag(matrix_tot))) # Shape: (4,4)
     
     return density_op
 
@@ -124,6 +124,24 @@ def budget_constraint(controls, states, Approx):
     return -budget
 
 
+def laws_of_motion(controls, state):
+    _, AD_1, AD_2, ALPHA_1, ALPHA_2 = unpack_controls(controls)
+    omega, z, _, _, _, _, coherence = unpack_states(state)
+    omega_new = evolve_omega(omega)
+    z_new = evolve_z(z)
+    coherence = coherence * np.exp(-DECOH * DT) * np.ones(4).reshape(-1,1)
+
+    omega_1 = (np.tile(omega_new, 2)).reshape(-1,1) # up, down, up, down
+    z_1 = (np.repeat(z_new, 2)).reshape(-1.1) # up, up, down, down
+    exogenous = np.vstack([omega_1, z_1])
+    alpha_1 = ALPHA_1 * np.ones(4).reshape(-1,1)
+    alpha_2 = ALPHA_2 * np.ones(4).reshape(-1,1)
+
+    states = np.hstack([exogenous, AD_1, AD_2, alpha_1, alpha_2, coherence])
+
+    return states
+
+
 # ================================================================
 # Agent's problem:
 # ================================================================
@@ -148,13 +166,78 @@ def utility(controls, state):
     return np.trace(U @ rho_C)
 
 
-def objective():
-    objective
+def expected_V(V, states_new):
+    
+    return (0.25 * V(states_new[1,:]) + 0.25 * V(states_new[2,:])
+            + 0.25 * V(states_new[3,:]) + 0.25 * V(states_new[4,:]))
+
+
+def objective(controls, state, V):
+
+    states_new = laws_of_motion(controls, state)
+
+    objective = utility(controls, state) * DT + expected_V(V, states_new)
+
+    return -objective
 
 
 def agent_optimization(Approx, V, states):
 
     constraints = [
         {'type': 'ineq',   'fun': budget_constraint,
-            'args': (states, Approx)}
-                    ]
+            'args': (states, Approx)
+            }
+        ]
+    
+    initial_guess = np.ones(28)
+
+    bounds = [(0.05, 4)] + [(-2, 2)] * 27
+
+    result = minimize(
+            objective,
+            initial_guess,
+            args=(states, V),
+            bounds=bounds,
+            constraints=constraints,
+            method="SLSQP",
+            )
+
+    return result
+
+
+# ================================================================
+# Value function and price iteration:
+# ================================================================
+
+
+def value_function_iteration(Approx, V, grid):
+
+    solution = np.zeros((*V.shape, 28))
+
+    V_old = V + 1.0  # Initialize V_old to be different from V_0 to start the iteration
+    state = np.zeros(9)
+
+    V_old = V.copy()
+
+    V_interpolator = RegularGridInterpolator(
+        (grid),  # Tuple of all grid coordinates
+        V,
+        method='linear',
+        bounds_error=False,
+        fill_value=None
+    )
+
+    # Update V using the agent's optimization problem:
+    for idx in np.ndindex(V.shape):
+        state = grid[idx]
+        result = agent_optimization(Approx, V_interpolator, state)
+        V[idx] = ((1 - UPDATE_SPEED) * V_old[idx]      # was V_old (full array)
+                    + UPDATE_SPEED * (-result.fun / DELTA)) 
+        solution[idx, :] = result.x  # Store the optimal controls and parameters for this state
+
+    return V, solution
+
+
+def excess_demand(Approx, V, grid):
+    V_new, solution = value_function_iteration(Approx, V, grid)
+    
